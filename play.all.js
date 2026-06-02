@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         YouTube Play All Channel Videos (v1.5 - Menu Filters)
+// @name         YouTube Play All Channel Videos (v1.6 - Menu Filters)
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Adds a floating menu on YouTube channel pages to play channel videos with optional Shorts and Live filtering.
 // @match        https://www.youtube.com/*
 // @grant        none
@@ -386,13 +386,18 @@
   }
 
   function collectPlayableIds(node, ids, seenIds) {
-    walk(node, value => {
+    walkEntries(node, (key, value) => {
       if (!value || typeof value !== 'object') {
         return;
       }
 
-      if (typeof value.videoId === 'string' && looksLikePlayableItem(value)) {
+      if (isVideoRendererKey(key) && typeof value.videoId === 'string') {
         pushVideoId(value.videoId, ids, seenIds);
+      }
+
+      const nestedVideoId = value.videoRenderer?.videoId || value.gridVideoRenderer?.videoId || value.playlistVideoRenderer?.videoId;
+      if (typeof nestedVideoId === 'string') {
+        pushVideoId(nestedVideoId, ids, seenIds);
       }
 
       const shortsId = value.shortsLockupViewModel?.onTap?.innertubeCommand?.reelWatchEndpoint?.videoId;
@@ -407,15 +412,15 @@
     });
   }
 
-  function looksLikePlayableItem(value) {
-    return Boolean(
-      value.title ||
-      value.thumbnail ||
-      value.thumbnailOverlays ||
-      value.navigationEndpoint ||
-      value.viewCountText ||
-      value.publishedTimeText
-    );
+  function isVideoRendererKey(key) {
+    return [
+      'videoRenderer',
+      'gridVideoRenderer',
+      'playlistVideoRenderer',
+      'compactVideoRenderer',
+      'reelItemRenderer',
+      'channelVideoPlayerRenderer'
+    ].includes(key);
   }
 
   function pushVideoId(videoId, ids, seenIds) {
@@ -462,6 +467,24 @@
 
     for (const value of Object.values(node)) {
       walk(value, visitor);
+    }
+  }
+
+  function walkEntries(node, visitor) {
+    if (!node || typeof node !== 'object') {
+      return;
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        walkEntries(item, visitor);
+      }
+      return;
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      visitor(key, value, node);
+      walkEntries(value, visitor);
     }
   }
 
