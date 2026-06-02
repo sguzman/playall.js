@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         YouTube Play All Channel Videos (v1.4 – externalId Fix)
+// @name         YouTube Play All Channel Videos (v1.5 - Menu Filters)
 // @namespace    http://tampermonkey.net/
-// @version      1.4
-// @description  Adds a “▶ Play All” button on any YouTube channel page. Now checks metadata.channelMetadataRenderer.externalId.
+// @version      1.5
+// @description  Adds a floating menu on YouTube channel pages to play channel videos with optional Shorts and Live filtering.
 // @match        https://www.youtube.com/*
 // @grant        none
 // @run-at       document-idle
@@ -10,44 +10,60 @@
 
 (function() {
   'use strict';
+
+  const MENU_ID = 'yt-play-all-menu';
+  const PLAY_BUTTON_ID = 'yt-play-all-btn';
+  const SHORTS_TOGGLE_ID = 'yt-play-all-toggle-shorts';
+  const LIVE_TOGGLE_ID = 'yt-play-all-toggle-live';
+  const STORAGE_KEYS = {
+    includeShorts: 'yt-play-all-include-shorts',
+    includeLive: 'yt-play-all-include-live'
+  };
+
   console.log('[PlayAll] Script start on', location.href);
 
   let currentChannelId = null;
-  let btn = null;
+  let menu = null;
+  let isBuildingPlaylist = false;
+  let includeShorts = loadBoolean(STORAGE_KEYS.includeShorts, false);
+  let includeLive = loadBoolean(STORAGE_KEYS.includeLive, false);
 
-  // --- Hook into YouTube SPA navigation ---
-  ['pushState','replaceState'].forEach(fn => {
-    const orig = history[fn];
+  ['pushState', 'replaceState'].forEach(fn => {
+    const original = history[fn];
     history[fn] = function() {
-      const ret = orig.apply(this, arguments);
+      const result = original.apply(this, arguments);
       window.dispatchEvent(new Event('locationchange'));
-      return ret;
+      return result;
     };
   });
+
   window.addEventListener('popstate', () => window.dispatchEvent(new Event('locationchange')));
   window.addEventListener('locationchange', init);
 
-  // --- Initial run ---
   init();
 
   function init() {
     console.log('[PlayAll] Running init()');
-    const id = getChannelId();
-    if (id) {
-      if (id !== currentChannelId) {
-        console.log('[PlayAll] ✅ New channelId detected:', id);
-        currentChannelId = id;
-        injectButton(id);
-      }
-    } else {
-      console.log('[PlayAll] ❌ No channelId found; removing button if present.');
+    const channelId = getChannelId();
+    const isChannelPage = hasChannelTabs() || isLikelyChannelPath();
+
+    if (!channelId || !isChannelPage) {
+      console.log('[PlayAll] ❌ Channel context unavailable; removing menu if present.');
       currentChannelId = null;
-      removeButton();
+      removeMenu();
+      return;
+    }
+
+    if (channelId !== currentChannelId || !document.getElementById(MENU_ID)) {
+      console.log('[PlayAll] ✅ Channel menu ready for:', channelId);
+      currentChannelId = channelId;
+      injectMenu();
+    } else {
+      syncMenuState();
     }
   }
 
   function getChannelId() {
-    // 1) meta[itemprop="channelId"]
     console.log('[PlayAll] → Checking <meta itemprop="channelId">');
     const meta = document.querySelector('meta[itemprop="channelId"]');
     if (meta?.content) {
@@ -56,7 +72,6 @@
     }
     console.log('[PlayAll]    • not found');
 
-    // 2) window.ytcfg.get("CHANNEL_ID")
     console.log('[PlayAll] → Checking ytcfg.get("CHANNEL_ID")');
     if (window.ytcfg?.get) {
       const cfg = window.ytcfg.get('CHANNEL_ID');
@@ -66,115 +81,413 @@
       console.log('[PlayAll]    • ytcfg not available');
     }
 
-    // 3) ytInitialData.metadata.channelMetadataRenderer.externalId
     console.log('[PlayAll] → Checking ytInitialData.metadata.channelMetadataRenderer.externalId');
-    const mdr = window.ytInitialData?.metadata?.channelMetadataRenderer;
-    if (mdr?.externalId) {
-      console.log('[PlayAll]    • externalId =', mdr.externalId);
-      return mdr.externalId;
-    } else {
-      console.log('[PlayAll]    • externalId not present');
+    const metadata = window.ytInitialData?.metadata?.channelMetadataRenderer;
+    if (metadata?.externalId) {
+      console.log('[PlayAll]    • externalId =', metadata.externalId);
+      return metadata.externalId;
     }
+    console.log('[PlayAll]    • externalId not present');
 
-    // 4) legacy externalChannelId (just in case)
     console.log('[PlayAll] → Checking ytInitialData.metadata.channelMetadataRenderer.externalChannelId');
-    if (mdr?.externalChannelId) {
-      console.log('[PlayAll]    • externalChannelId =', mdr.externalChannelId);
-      return mdr.externalChannelId;
-    } else {
-      console.log('[PlayAll]    • externalChannelId not present');
+    if (metadata?.externalChannelId) {
+      console.log('[PlayAll]    • externalChannelId =', metadata.externalChannelId);
+      return metadata.externalChannelId;
     }
+    console.log('[PlayAll]    • externalChannelId not present');
 
-    // 5) header.c4TabbedHeaderRenderer.channelId
     console.log('[PlayAll] → Checking ytInitialData.header.c4TabbedHeaderRenderer.channelId');
-    const hdr = window.ytInitialData?.header?.c4TabbedHeaderRenderer;
-    if (hdr?.channelId) {
-      console.log('[PlayAll]    • header channelId =', hdr.channelId);
-      return hdr.channelId;
-    } else {
-      console.log('[PlayAll]    • not present');
+    const header = window.ytInitialData?.header?.c4TabbedHeaderRenderer;
+    if (header?.channelId) {
+      console.log('[PlayAll]    • header channelId =', header.channelId);
+      return header.channelId;
     }
+    console.log('[PlayAll]    • not present');
 
-    // 6) JSON-LD <script> tags
     console.log('[PlayAll] → Scanning JSON-LD <script> tags');
-    for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+    for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
       try {
-        const obj = JSON.parse(s.textContent);
-        if (obj['@type'] === 'Person' && obj.mainEntityOfPage?.['@id']) {
-          const m = obj.mainEntityOfPage['@id'].match(/channel\/([A-Za-z0-9_-]+)/);
-          if (m) {
-            console.log('[PlayAll]    • JSON-LD channel ID =', m[1]);
-            return m[1];
+        const json = JSON.parse(script.textContent);
+        if (json['@type'] === 'Person' && json.mainEntityOfPage?.['@id']) {
+          const match = json.mainEntityOfPage['@id'].match(/channel\/([A-Za-z0-9_-]+)/);
+          if (match) {
+            console.log('[PlayAll]    • JSON-LD channel ID =', match[1]);
+            return match[1];
           }
         }
-      } catch(e) {
-        console.log('[PlayAll]    • JSON-LD parse error', e);
+      } catch (error) {
+        console.log('[PlayAll]    • JSON-LD parse error', error);
       }
     }
     console.log('[PlayAll]    • no JSON-LD match');
 
-    // 7) anchor link lookup
     console.log('[PlayAll] → Scanning <a> for "/channel/"');
     const anchor = document.querySelector('a[href*="/channel/"]');
     if (anchor?.href) {
-      const m = anchor.href.match(/\/channel\/([A-Za-z0-9_-]+)/);
-      if (m) {
-        console.log('[PlayAll]    • anchor href channel ID =', m[1]);
-        return m[1];
+      const match = anchor.href.match(/\/channel\/([A-Za-z0-9_-]+)/);
+      if (match) {
+        console.log('[PlayAll]    • anchor href channel ID =', match[1]);
+        return match[1];
       }
     }
     console.log('[PlayAll]    • no anchor match');
 
-    // 8) URL path fallback
     console.log('[PlayAll] → Fallback: URL path /channel/ID');
     const parts = location.pathname.split('/');
-    const idx = parts.indexOf('channel');
-    if (idx !== -1 && parts[idx+1]) {
-      console.log('[PlayAll]    • URL path channelId =', parts[idx+1]);
-      return parts[idx+1];
+    const index = parts.indexOf('channel');
+    if (index !== -1 && parts[index + 1]) {
+      console.log('[PlayAll]    • URL path channelId =', parts[index + 1]);
+      return parts[index + 1];
     }
     console.log('[PlayAll]    • URL fallback not applicable');
 
-    // nothing found
     return null;
   }
 
-  function injectButton(channelId) {
-    removeButton();
-    btn = document.createElement('button');
-    btn.id = 'yt-play-all-btn';
-    btn.textContent = '▶ Play All';
-    Object.assign(btn.style, {
+  function injectMenu() {
+    removeMenu();
+
+    menu = document.createElement('div');
+    menu.id = MENU_ID;
+    Object.assign(menu.style, {
       position: 'fixed',
       top: '120px',
       right: '20px',
-      padding: '10px 16px',
-      backgroundColor: '#FF0000',
-      color: '#FFF',
-      border: 'none',
-      borderRadius: '4px',
-      fontSize: '14px',
-      cursor: 'pointer',
-      zIndex: 9999,
-      boxShadow: '0 2px 6px rgba(0,0,0,0.3)'
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '8px',
+      width: '190px',
+      padding: '12px',
+      backgroundColor: 'rgba(15, 15, 15, 0.92)',
+      border: '1px solid rgba(255, 255, 255, 0.12)',
+      borderRadius: '10px',
+      boxShadow: '0 8px 24px rgba(0, 0, 0, 0.35)',
+      zIndex: 9999
     });
-    btn.addEventListener('click', () => {
-      console.log('[PlayAll] ▶ Button clicked');
-      const uploads = channelId.replace(/^UC/, 'UU');
-      const url = `https://www.youtube.com/playlist?list=${uploads}`;
-      console.log('[PlayAll] ↗ Redirecting to:', url);
-      window.location.href = url;
+
+    const shortsToggle = buildToggleButton(SHORTS_TOGGLE_ID, 'Shorts', includeShorts, () => {
+      includeShorts = !includeShorts;
+      localStorage.setItem(STORAGE_KEYS.includeShorts, String(includeShorts));
+      syncMenuState();
     });
-    document.body.appendChild(btn);
-    console.log('[PlayAll] ✅ Button injected');
+
+    const liveToggle = buildToggleButton(LIVE_TOGGLE_ID, 'Live', includeLive, () => {
+      includeLive = !includeLive;
+      localStorage.setItem(STORAGE_KEYS.includeLive, String(includeLive));
+      syncMenuState();
+    });
+
+    const playButton = document.createElement('button');
+    playButton.id = PLAY_BUTTON_ID;
+    playButton.addEventListener('click', handlePlayAll);
+
+    Object.assign(playButton.style, buttonStyle('#ff0000'));
+    menu.appendChild(shortsToggle);
+    menu.appendChild(liveToggle);
+    menu.appendChild(playButton);
+
+    document.body.appendChild(menu);
+    syncMenuState();
+    console.log('[PlayAll] ✅ Menu injected');
   }
 
-  function removeButton() {
-    const e = document.getElementById('yt-play-all-btn');
-    if (e) {
-      e.remove();
-      console.log('[PlayAll] 🗑️ Button removed');
+  function buildToggleButton(id, label, enabled, onClick) {
+    const button = document.createElement('button');
+    button.id = id;
+    button.dataset.label = label;
+    button.addEventListener('click', onClick);
+    Object.assign(button.style, buttonStyle(enabled ? '#2e7d32' : '#444'));
+    return button;
+  }
+
+  function buttonStyle(backgroundColor) {
+    return {
+      width: '100%',
+      padding: '10px 12px',
+      backgroundColor,
+      color: '#fff',
+      border: 'none',
+      borderRadius: '6px',
+      fontSize: '14px',
+      fontWeight: '600',
+      cursor: 'pointer',
+      textAlign: 'left'
+    };
+  }
+
+  function syncMenuState() {
+    const shortsToggle = document.getElementById(SHORTS_TOGGLE_ID);
+    const liveToggle = document.getElementById(LIVE_TOGGLE_ID);
+    const playButton = document.getElementById(PLAY_BUTTON_ID);
+
+    if (shortsToggle) {
+      shortsToggle.textContent = `Include Shorts: ${includeShorts ? 'On' : 'Off'}`;
+      shortsToggle.style.backgroundColor = includeShorts ? '#2e7d32' : '#444';
     }
-    btn = null;
+
+    if (liveToggle) {
+      liveToggle.textContent = `Include Live: ${includeLive ? 'On' : 'Off'}`;
+      liveToggle.style.backgroundColor = includeLive ? '#2e7d32' : '#444';
+    }
+
+    if (playButton) {
+      playButton.disabled = isBuildingPlaylist;
+      playButton.textContent = isBuildingPlaylist ? 'Building playlist...' : '▶ Play All';
+      playButton.style.backgroundColor = isBuildingPlaylist ? '#9e9e9e' : '#ff0000';
+      playButton.style.cursor = isBuildingPlaylist ? 'wait' : 'pointer';
+    }
+  }
+
+  async function handlePlayAll() {
+    if (isBuildingPlaylist || !currentChannelId) {
+      return;
+    }
+
+    isBuildingPlaylist = true;
+    syncMenuState();
+
+    try {
+      console.log('[PlayAll] ▶ Play All clicked', { includeShorts, includeLive });
+
+      if (includeShorts && includeLive && currentChannelId.startsWith('UC')) {
+        const uploads = currentChannelId.replace(/^UC/, 'UU');
+        const url = `https://www.youtube.com/playlist?list=${uploads}`;
+        console.log('[PlayAll] ↗ Redirecting to uploads playlist:', url);
+        window.location.href = url;
+        return;
+      }
+
+      const endpoints = getChannelTabEndpoints();
+      if (!endpoints.videos) {
+        throw new Error('Could not find the channel Videos tab endpoint.');
+      }
+
+      const ids = [];
+      const seenIds = new Set();
+
+      await appendTabVideos(ids, seenIds, endpoints.videos, 'videos');
+
+      if (includeShorts) {
+        if (!endpoints.shorts) {
+          console.warn('[PlayAll] Shorts toggle enabled but Shorts tab was not found.');
+        } else {
+          await appendTabVideos(ids, seenIds, endpoints.shorts, 'shorts');
+        }
+      }
+
+      if (includeLive) {
+        if (!endpoints.live) {
+          console.warn('[PlayAll] Live toggle enabled but Live tab was not found.');
+        } else {
+          await appendTabVideos(ids, seenIds, endpoints.live, 'live');
+        }
+      }
+
+      if (!ids.length) {
+        throw new Error('No videos were found for the selected filters.');
+      }
+
+      const url = `https://www.youtube.com/watch_videos?video_ids=${ids.join(',')}`;
+      console.log('[PlayAll] ↗ Redirecting to custom playlist with', ids.length, 'videos');
+      window.location.href = url;
+    } catch (error) {
+      console.error('[PlayAll] Failed to build playlist', error);
+      alert(`[PlayAll] ${error.message}`);
+    } finally {
+      isBuildingPlaylist = false;
+      syncMenuState();
+    }
+  }
+
+  async function appendTabVideos(ids, seenIds, endpoint, label) {
+    console.log(`[PlayAll] → Fetching ${label} tab`);
+    let response = await browseEndpoint(endpoint);
+    collectPlayableIds(response, ids, seenIds);
+
+    const seenTokens = new Set();
+    let continuation = findContinuationToken(response, seenTokens);
+
+    while (continuation) {
+      console.log(`[PlayAll] → Continuing ${label} tab`);
+      response = await browseContinuation(continuation);
+      collectPlayableIds(response, ids, seenIds);
+      continuation = findContinuationToken(response, seenTokens);
+    }
+
+    console.log(`[PlayAll]    • ${label} videos collected:`, ids.length);
+  }
+
+  function getChannelTabEndpoints() {
+    const tabs = window.ytInitialData?.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
+    const endpoints = {};
+
+    for (const item of tabs) {
+      const renderer = item.tabRenderer || item.expandableTabRenderer;
+      const browseEndpoint = renderer?.endpoint?.browseEndpoint;
+      const url = renderer?.endpoint?.commandMetadata?.webCommandMetadata?.url || '';
+
+      if (!browseEndpoint || !url) {
+        continue;
+      }
+
+      if (/\/videos(?:[/?]|$)/.test(url)) {
+        endpoints.videos = browseEndpoint;
+      } else if (/\/shorts(?:[/?]|$)/.test(url)) {
+        endpoints.shorts = browseEndpoint;
+      } else if (/\/(?:streams|live)(?:[/?]|$)/.test(url)) {
+        endpoints.live = browseEndpoint;
+      }
+    }
+
+    return endpoints;
+  }
+
+  async function browseEndpoint(endpoint) {
+    return postBrowse({
+      browseId: endpoint.browseId,
+      params: endpoint.params,
+      canonicalBaseUrl: endpoint.canonicalBaseUrl
+    });
+  }
+
+  async function browseContinuation(continuation) {
+    return postBrowse({ continuation });
+  }
+
+  async function postBrowse(payload) {
+    const apiKey = window.ytcfg?.get?.('INNERTUBE_API_KEY');
+    const clientName = window.ytcfg?.get?.('INNERTUBE_CLIENT_NAME');
+    const clientVersion = window.ytcfg?.get?.('INNERTUBE_CLIENT_VERSION');
+    const context = clone(window.ytcfg?.get?.('INNERTUBE_CONTEXT'));
+
+    if (!apiKey || !clientName || !clientVersion || !context) {
+      throw new Error('YouTube API context is not available on this page.');
+    }
+
+    const response = await fetch(`https://www.youtube.com/youtubei/v1/browse?key=${encodeURIComponent(apiKey)}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'content-type': 'application/json',
+        'x-youtube-client-name': String(clientName),
+        'x-youtube-client-version': String(clientVersion)
+      },
+      body: JSON.stringify({
+        context,
+        ...payload
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`YouTube browse request failed with status ${response.status}.`);
+    }
+
+    return response.json();
+  }
+
+  function collectPlayableIds(node, ids, seenIds) {
+    walk(node, value => {
+      if (!value || typeof value !== 'object') {
+        return;
+      }
+
+      if (typeof value.videoId === 'string' && looksLikePlayableItem(value)) {
+        pushVideoId(value.videoId, ids, seenIds);
+      }
+
+      const shortsId = value.shortsLockupViewModel?.onTap?.innertubeCommand?.reelWatchEndpoint?.videoId;
+      if (typeof shortsId === 'string') {
+        pushVideoId(shortsId, ids, seenIds);
+      }
+
+      const reelId = value.reelItemRenderer?.videoId;
+      if (typeof reelId === 'string') {
+        pushVideoId(reelId, ids, seenIds);
+      }
+    });
+  }
+
+  function looksLikePlayableItem(value) {
+    return Boolean(
+      value.title ||
+      value.thumbnail ||
+      value.thumbnailOverlays ||
+      value.navigationEndpoint ||
+      value.viewCountText ||
+      value.publishedTimeText
+    );
+  }
+
+  function pushVideoId(videoId, ids, seenIds) {
+    if (!seenIds.has(videoId)) {
+      seenIds.add(videoId);
+      ids.push(videoId);
+    }
+  }
+
+  function findContinuationToken(node, seenTokens) {
+    let nextToken = null;
+
+    walk(node, value => {
+      if (nextToken || !value || typeof value !== 'object') {
+        return;
+      }
+
+      const continuationToken =
+        value.continuationEndpoint?.continuationCommand?.token ||
+        value.nextContinuationData?.continuation;
+
+      if (continuationToken && !seenTokens.has(continuationToken)) {
+        seenTokens.add(continuationToken);
+        nextToken = continuationToken;
+      }
+    });
+
+    return nextToken;
+  }
+
+  function walk(node, visitor) {
+    if (!node || typeof node !== 'object') {
+      return;
+    }
+
+    visitor(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        walk(item, visitor);
+      }
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      walk(value, visitor);
+    }
+  }
+
+  function hasChannelTabs() {
+    return Array.isArray(window.ytInitialData?.contents?.twoColumnBrowseResultsRenderer?.tabs);
+  }
+
+  function isLikelyChannelPath() {
+    return /^\/(@[^/]+|channel\/[^/]+|c\/[^/]+|user\/[^/]+)(\/|$)/.test(location.pathname);
+  }
+
+  function loadBoolean(key, fallback) {
+    const value = localStorage.getItem(key);
+    return value == null ? fallback : value === 'true';
+  }
+
+  function clone(value) {
+    return value ? JSON.parse(JSON.stringify(value)) : null;
+  }
+
+  function removeMenu() {
+    const element = document.getElementById(MENU_ID);
+    if (element) {
+      element.remove();
+      console.log('[PlayAll] 🗑️ Menu removed');
+    }
+    menu = null;
   }
 })();
