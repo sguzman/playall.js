@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         YouTube Play All Channel Videos (v1.6 - Menu Filters)
+// @name         YouTube Play All Channel Videos (v1.7 - Menu Filters)
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.7
 // @description  Adds a floating menu on YouTube channel pages to play channel videos with optional Shorts and Live filtering.
 // @match        https://www.youtube.com/*
 // @grant        none
@@ -299,9 +299,10 @@
     }
   }
 
-  async function appendTabVideos(ids, seenIds, endpoint, label) {
+  async function appendTabVideos(ids, seenIds, endpointInfo, label) {
     console.log(`[PlayAll] → Fetching ${label} tab`);
-    let response = await browseEndpoint(endpoint);
+    const startCount = ids.length;
+    let response = await browseEndpoint(endpointInfo.browseEndpoint);
     collectPlayableIds(response, ids, seenIds);
 
     const seenTokens = new Set();
@@ -312,6 +313,11 @@
       response = await browseContinuation(continuation);
       collectPlayableIds(response, ids, seenIds);
       continuation = findContinuationToken(response, seenTokens);
+    }
+
+    if (ids.length === startCount && endpointInfo.url) {
+      console.log(`[PlayAll] → Falling back to HTML scan for ${label} tab`);
+      await appendVideosFromTabHtml(ids, seenIds, endpointInfo.url);
     }
 
     console.log(`[PlayAll]    • ${label} videos collected:`, ids.length);
@@ -331,11 +337,11 @@
       }
 
       if (/\/videos(?:[/?]|$)/.test(url)) {
-        endpoints.videos = browseEndpoint;
+        endpoints.videos = { browseEndpoint, url };
       } else if (/\/shorts(?:[/?]|$)/.test(url)) {
-        endpoints.shorts = browseEndpoint;
+        endpoints.shorts = { browseEndpoint, url };
       } else if (/\/(?:streams|live)(?:[/?]|$)/.test(url)) {
-        endpoints.live = browseEndpoint;
+        endpoints.live = { browseEndpoint, url };
       }
     }
 
@@ -383,6 +389,24 @@
     }
 
     return response.json();
+  }
+
+  async function appendVideosFromTabHtml(ids, seenIds, url) {
+    const response = await fetch(toAbsoluteYouTubeUrl(url), {
+      credentials: 'same-origin'
+    });
+
+    if (!response.ok) {
+      throw new Error(`Fallback tab request failed with status ${response.status}.`);
+    }
+
+    const html = await response.text();
+    const matches = html.match(/"videoId":"([A-Za-z0-9_-]{11})"/g) || [];
+
+    for (const match of matches) {
+      const videoId = match.slice(11, -1);
+      pushVideoId(videoId, ids, seenIds);
+    }
   }
 
   function collectPlayableIds(node, ids, seenIds) {
@@ -503,6 +527,10 @@
 
   function clone(value) {
     return value ? JSON.parse(JSON.stringify(value)) : null;
+  }
+
+  function toAbsoluteYouTubeUrl(url) {
+    return url.startsWith('http') ? url : `https://www.youtube.com${url}`;
   }
 
   function removeMenu() {
